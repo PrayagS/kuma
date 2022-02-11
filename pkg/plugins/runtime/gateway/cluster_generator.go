@@ -8,9 +8,9 @@ import (
 
 	mesh_proto "github.com/kumahq/kuma/api/mesh/v1alpha1"
 	"github.com/kumahq/kuma/pkg/core/datasource"
+	"github.com/kumahq/kuma/pkg/core/permissions"
 	core_mesh "github.com/kumahq/kuma/pkg/core/resources/apis/mesh"
 	core_xds "github.com/kumahq/kuma/pkg/core/xds"
-	"github.com/kumahq/kuma/pkg/plugins/runtime/gateway/match"
 	"github.com/kumahq/kuma/pkg/plugins/runtime/gateway/route"
 	xds_context "github.com/kumahq/kuma/pkg/xds/context"
 	"github.com/kumahq/kuma/pkg/xds/envoy"
@@ -34,6 +34,23 @@ func (*ClusterGenerator) SupportsProtocol(mesh_proto.MeshGateway_Listener_Protoc
 func (c *ClusterGenerator) GenerateClusters(ctx xds_context.Context, info GatewayListenerInfo, routes []route.Entry) (*core_xds.ResourceSet, error) {
 	resources := core_xds.NewResourceSet()
 
+	// TODO put this on info
+	matchedExternalServices, err := permissions.MatchExternalServices(
+		info.Dataplane, ctx.Mesh.Resources.ExternalServices(), ctx.Mesh.Resources.TrafficPermissions(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	outbound := topology.BuildEndpointMap(
+		ctx.Mesh.Resource,
+		c.Zone,
+		ctx.Mesh.Resources.Dataplanes().Items,
+		ctx.Mesh.Resources.ZoneIngresses().Items,
+		ctx.Mesh.Resources.ZoneEgresses().Items,
+		matchedExternalServices, c.DataSourceLoader,
+	)
+
 	// If there is a service name conflict between external services
 	// and mesh services, the external service takes priority since
 	// it's easier to deterministically know it is present.
@@ -43,27 +60,33 @@ func (c *ClusterGenerator) GenerateClusters(ctx xds_context.Context, info Gatewa
 	// an external service. Because the dataplane endpoints happen to be
 	// generated first, the mesh service will have priority.
 	for _, dest := range routeDestinations(routes) {
-		matched := match.ExternalService(info.ExternalServices, mesh_proto.TagSelector(dest.Destination))
+		service := dest.Destination[mesh_proto.ServiceTag]
+
+		firstEndpointExternalService := false
+		if endpoints := outbound[service]; len(endpoints) > 0 {
+			ep := endpoints[0]
+			if ep.IsExternalService() {
+				firstEndpointExternalService = true
+			}
+		}
 
 		// If there are zone egresses present we want to direct the traffic
 		// through tem. The condition is, the mesh must have mTLS enabled
 		zoneEgresses := ctx.Mesh.Resources.ZoneEgresses().Items
 		mtlsEnabled := ctx.Mesh.Resource.MTLSEnabled()
 
-		isDirectExternalService := len(matched.Items) > 0 && (len(zoneEgresses) == 0 || !mtlsEnabled)
-		isExternalServiceThroughZoneEgress := len(matched.Items) > 0 && !isDirectExternalService
+		isDirectExternalService := firstEndpointExternalService && (len(zoneEgresses) == 0 || !mtlsEnabled)
+		isExternalServiceThroughZoneEgress := firstEndpointExternalService && !isDirectExternalService
 
-		r, err := func() (*core_xds.Resource, error) {
-			service := dest.Destination[mesh_proto.ServiceTag]
+		var r *core_xds.Resource
 
-			if isDirectExternalService {
-				log.V(1).Info("generating external service cluster",
-					"service", service,
-				)
+		if isDirectExternalService {
+			log.V(1).Info("generating external service cluster",
+				"service", service,
+			)
 
-				return c.generateExternalCluster(ctx, info, matched, dest)
-			}
-
+			r, err = c.generateExternalCluster(ctx, info, matchedExternalServices, dest)
+		} else {
 			log.Info("generating mesh cluster resource",
 				"service", service,
 			)
@@ -73,8 +96,8 @@ func (c *ClusterGenerator) GenerateClusters(ctx xds_context.Context, info Gatewa
 				upstreamServiceName = mesh_proto.ZoneEgressServiceName
 			}
 
-			return c.generateMeshCluster(ctx.Mesh.Resource, info, dest, upstreamServiceName)
-		}()
+			r, err = c.generateMeshCluster(ctx.Mesh.Resource, info, dest, upstreamServiceName)
+		}
 
 		if err != nil {
 			return nil, err
@@ -145,12 +168,12 @@ func (c *ClusterGenerator) generateMeshCluster(
 func (c *ClusterGenerator) generateExternalCluster(
 	ctx xds_context.Context,
 	info GatewayListenerInfo,
-	service core_mesh.ExternalServiceResourceList,
+	externalServices []*core_mesh.ExternalServiceResource,
 	dest *route.Destination,
 ) (*core_xds.Resource, error) {
 	var endpoints []core_xds.Endpoint
 
-	for _, ext := range service.Items {
+	for _, ext := range externalServices {
 		ep, err := topology.NewExternalServiceEndpoint(ext, ctx.Mesh.Resource, c.DataSourceLoader, c.Zone)
 		if err != nil {
 			return nil, err
